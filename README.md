@@ -1,6 +1,6 @@
-#Ascendant.Finance
+# Ascendant.Finance
 
-##Security Audits
+## Security Audits
 
 The smart contract audits contained in this repository were conducted by the Ascendant.Finance team, which conducted a manual line-by-line audit and used automation tools to identify any suspicious code. 
 
@@ -13,7 +13,7 @@ The following tools are used by Ascendant.Finance to conduct its analysis:
 
 
 
-##Contact
+## Contact
 
 For inquiries, please reach out to any of the following channels:
 
@@ -22,7 +22,7 @@ hello@ascendant.finance
 X: ascendantfi
 
 
-##Disclaimer
+## Disclaimer
 
 This independent audit has been conducted to verify the integrity of and highlight any vulnerabilities or errors, intentional or unintentional, that may be present in the codes that were provided for the scope of this audit. This audit report does not constitute agreement, acceptance or advocation for the Project that was audited, and users relying on this audit report should not consider this as having any merit for financial advice in any shape, form or nature. The contracts audited do not account for any economic developments that may be pursued by the Project in question, and that the veracity of the findings thus presented in this report relate solely to the proficiency, competence, aptitude and discretion of our independent auditors, who make no guarantees nor assurance that the contracts are completely free of exploits, bugs, vulnerabilities or deprecation of technologies. Further, this audit report shall not be disclosed nor transmitted to any persons or parties on any objective, goal or justification without due written assent, acquiescence or approval by the auditor.
 All information provided in this report does not constitute financial or investment advice, nor should it be used to signal that any persons reading this report should invest their funds without sufficient individual due diligence regardless of the findings presented in this report. Information is provided ‘as is’, and the auditor is under no covenant to the completeness, accuracy or solidity of the contracts audited. In no event will the auditor or its partners, employees, agents or parties related to the provision of this audit report be liable to any parties for, or lack thereof, decisions and/or actions with regards to the information provided in this audit report.
