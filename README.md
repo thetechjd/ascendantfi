@@ -18,6 +18,7 @@ The following tools are used by Ascendant.Finance to conduct its analysis:
 For inquiries, please reach out to any of the following channels:
 
 hello@ascendant.finance
+
 X: ascendantfi
 
 
