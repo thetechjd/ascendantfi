@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 // Interface for wrapped native token
 interface IWrappedNativeToken {
@@ -20,21 +21,7 @@ interface IWrappedNativeToken {
     function approve(address spender, uint256 amount) external returns (bool);
 }
 
-// Interface for ERC20 tokens
-interface IERC20 {
-    function transfer(address to, uint256 amount) external returns (bool);
-    function transferFrom(
-        address from,
-        address to,
-        uint256 amount
-    ) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
-    function approve(address spender, uint256 amount) external returns (bool);
-    function allowance(
-        address owner,
-        address spender
-    ) external view returns (uint256);
-}
+// IERC20 interface is imported from SafeERC20
 
 /**
  * @title PredictionGame
@@ -42,12 +29,13 @@ interface IERC20 {
  * Users can bet on whether the price will go UP or DOWN in the next round
  * Uses wrapped native tokens for all transactions
  */
-contract PredictionGame is 
+contract PredictionGame is
     Initializable,
     OwnableUpgradeable,
     PausableUpgradeable,
     ReentrancyGuardUpgradeable
 {
+    using SafeERC20 for IERC20;
     enum Position {
         Bull, // UP
         Bear // DOWN
@@ -108,6 +96,12 @@ contract PredictionGame is
     mapping(address => uint256) public treasuryAmount;
     uint256 public constant TOTAL_RATE = 10000; // 100%
 
+    // Pause/Unpause cooldown and rate limiting
+    uint256 public constant PAUSE_COOLDOWN_PERIOD = 3600; // 1 hour in seconds
+    uint256 public constant MAX_DAILY_PAUSE_TOGGLES = 3; // Maximum 3 pause/unpause cycles per day
+    uint256 public lastPauseToggleTime;
+    uint256 public dailyToggleCount;
+    uint256 public lastToggleDay;
 
     event BetBull(
         address indexed sender,
@@ -172,20 +166,78 @@ contract PredictionGame is
     event TokenRecovery(address indexed token, uint256 amount);
     event TreasuryClaim(address indexed paymentToken, uint256 amount);
     event Unpause(uint256 indexed epoch);
+    event PauseCooldownViolation(address indexed caller, uint256 timeRemaining);
+    event DailyToggleLimitExceeded(
+        address indexed caller,
+        uint256 currentCount
+    );
+
+    // Custom errors for gas optimization
+    error NotOperatorAdmin();
+    error NotOperator();
+    error PauseCooldownPeriodNotElapsed();
+    error DailyPauseToggleLimitExceeded();
+    error TreasuryFeeTooHigh();
+    error WrappedTokenAddressCannotBeZero();
+    error TreasuryAddressCannotBeZero();
+    error BetIsTooEarlyOrLate();
+    error RoundNotBettable();
+    error BetAmountMustBeGreaterThanMinBetAmount();
+    error CannotBetOnDifferentPositionInSameRound();
+    error RoundHasNotStarted();
+    error RoundHasNotEnded();
+    error NotEligibleForClaim();
+    error NotEligibleForRefund();
+    error PaymentTokenAddressCannotBeZero();
+    error GameTokenAddressCannotBeZero();
+    error TokenAlreadyInitialized();
+    error TokenMustBeInitializedFirst();
+    error CannotBeZeroAddress();
+    error TransferHelperBNBTransferFailed();
+    error RewardsAlreadyCalculated();
+    error CanOnlyEndRoundAfterRoundHasLocked();
+    error CanOnlyEndRoundAfterEndTimestamp();
+    error CanOnlyLockRoundAfterRoundHasStarted();
+    error CanOnlyStartRoundAfterRoundN2HasEnded();
+    error CanOnlyStartNewRoundAfterRoundN2EndTimestamp();
+    error MustBeSuperiorToZero();
 
     modifier onlyAdminOrOperator() {
-        require(
-            msg.sender == owner() || msg.sender == operatorAddress,
-            "Not operator/admin"
-        );
+        if (msg.sender != owner() && msg.sender != operatorAddress) {
+            revert NotOperatorAdmin();
+        }
         _;
     }
 
     modifier onlyOperator() {
-        require(msg.sender == operatorAddress, "Not operator");
+        if (msg.sender != operatorAddress) {
+            revert NotOperator();
+        }
         _;
     }
 
+    modifier pauseCooldownCheck() {
+        if (block.timestamp < lastPauseToggleTime + PAUSE_COOLDOWN_PERIOD) {
+            revert PauseCooldownPeriodNotElapsed();
+        }
+
+        // Reset daily count if it's a new day
+        uint256 currentDay = block.timestamp / 86400; // 86400 seconds = 1 day
+        if (currentDay > lastToggleDay) {
+            dailyToggleCount = 0;
+            lastToggleDay = currentDay;
+        }
+
+        if (dailyToggleCount >= MAX_DAILY_PAUSE_TOGGLES) {
+            revert DailyPauseToggleLimitExceeded();
+        }
+
+        _;
+
+        // Update tracking variables after successful toggle
+        lastPauseToggleTime = block.timestamp;
+        dailyToggleCount++;
+    }
 
     /**
      * @notice Initialize function (replaces constructor for upgradeable contracts)
@@ -202,11 +254,15 @@ contract PredictionGame is
         uint256 _intervalSeconds,
         uint256 _treasuryFee
     ) public initializer {
-        require(_treasuryFee <= MAX_TREASURY_FEE, "Treasury fee too high");
-        require(
-            _wrappedNativeToken != address(0),
-            "Wrapped token address cannot be zero"
-        );
+        if (_treasuryFee > MAX_TREASURY_FEE) {
+            revert TreasuryFeeTooHigh();
+        }
+        if (_wrappedNativeToken == address(0)) {
+            revert WrappedTokenAddressCannotBeZero();
+        }
+        if (_treasuryAddress == address(0)) {
+            revert TreasuryAddressCannotBeZero();
+        }
 
         __Ownable_init(msg.sender);
         __Pausable_init();
@@ -217,6 +273,9 @@ contract PredictionGame is
         wrappedNativeToken = _wrappedNativeToken;
         intervalSeconds = _intervalSeconds;
         treasuryFee = _treasuryFee;
+
+        // Initialize pause/unpause cooldown tracking
+        lastToggleDay = block.timestamp / 86400;
     }
 
     /**
@@ -232,31 +291,27 @@ contract PredictionGame is
         uint256 epoch,
         uint256 amount
     ) external payable whenNotPaused nonReentrant {
-        require(
-            epoch == currentEpoch[paymentTokenAddress][gameTokenAddress],
-            "Bet is too early/late"
-        );
-        require(
-            bettable(paymentTokenAddress, gameTokenAddress, epoch),
-            "Round not bettable"
-        );
+        if (epoch != currentEpoch[paymentTokenAddress][gameTokenAddress]) {
+            revert BetIsTooEarlyOrLate();
+        }
+        if (!bettable(paymentTokenAddress, gameTokenAddress, epoch)) {
+            revert RoundNotBettable();
+        }
 
         uint256 betAmount;
         if (paymentTokenAddress == wrappedNativeToken) {
             // Native token payment
-            require(
-                msg.value >= minBetAmount[paymentTokenAddress],
-                "Bet amount must be greater than minBetAmount"
-            );
+            if (msg.value < minBetAmount[paymentTokenAddress]) {
+                revert BetAmountMustBeGreaterThanMinBetAmount();
+            }
             betAmount = msg.value;
             // Wrap native tokens - this mints wrapped tokens to this contract
             IWrappedNativeToken(wrappedNativeToken).deposit{value: betAmount}();
         } else {
             // ERC20 token payment
-            require(
-                amount >= minBetAmount[paymentTokenAddress],
-                "Bet amount must be greater than minBetAmount"
-            );
+            if (amount < minBetAmount[paymentTokenAddress]) {
+                revert BetAmountMustBeGreaterThanMinBetAmount();
+            }
             betAmount = amount;
             // Transfer ERC20 tokens from user to this contract
             IERC20(paymentTokenAddress).transferFrom(
@@ -267,11 +322,12 @@ contract PredictionGame is
         }
 
         // Allow multiple bets - check if user already has a bet with different position
-        BetInfo storage existingBet = ledger[paymentTokenAddress][gameTokenAddress][epoch][msg.sender];
-        require(
-            existingBet.amount == 0 || existingBet.position == Position.Bull,
-            "Cannot bet on different position in same round"
-        );
+        BetInfo storage existingBet = ledger[paymentTokenAddress][
+            gameTokenAddress
+        ][epoch][msg.sender];
+        if (existingBet.amount != 0 && existingBet.position != Position.Bull) {
+            revert CannotBetOnDifferentPositionInSameRound();
+        }
 
         // Update round data
         Round storage round = rounds[paymentTokenAddress][gameTokenAddress][
@@ -286,7 +342,7 @@ contract PredictionGame is
         ][msg.sender];
         betInfo.position = Position.Bull;
         betInfo.amount = betInfo.amount + betAmount;
-        
+
         // Only add to userRounds if this is the first bet for this round
         if (betInfo.amount == betAmount) {
             userRounds[paymentTokenAddress][gameTokenAddress][msg.sender].push(
@@ -316,31 +372,27 @@ contract PredictionGame is
         uint256 epoch,
         uint256 amount
     ) external payable whenNotPaused nonReentrant {
-        require(
-            epoch == currentEpoch[paymentTokenAddress][gameTokenAddress],
-            "Bet is too early/late"
-        );
-        require(
-            bettable(paymentTokenAddress, gameTokenAddress, epoch),
-            "Round not bettable"
-        );
+        if (epoch != currentEpoch[paymentTokenAddress][gameTokenAddress]) {
+            revert BetIsTooEarlyOrLate();
+        }
+        if (!bettable(paymentTokenAddress, gameTokenAddress, epoch)) {
+            revert RoundNotBettable();
+        }
 
         uint256 betAmount;
         if (paymentTokenAddress == wrappedNativeToken) {
             // Native token payment
-            require(
-                msg.value >= minBetAmount[paymentTokenAddress],
-                "Bet amount must be greater than minBetAmount"
-            );
+            if (msg.value < minBetAmount[paymentTokenAddress]) {
+                revert BetAmountMustBeGreaterThanMinBetAmount();
+            }
             betAmount = msg.value;
             // Wrap native tokens for the user
             IWrappedNativeToken(wrappedNativeToken).deposit{value: betAmount}();
         } else {
             // ERC20 token payment
-            require(
-                amount >= minBetAmount[paymentTokenAddress],
-                "Bet amount must be greater than minBetAmount"
-            );
+            if (amount < minBetAmount[paymentTokenAddress]) {
+                revert BetAmountMustBeGreaterThanMinBetAmount();
+            }
             betAmount = amount;
             // Transfer ERC20 tokens from user to this contract
             IERC20(paymentTokenAddress).transferFrom(
@@ -351,11 +403,12 @@ contract PredictionGame is
         }
 
         // Allow multiple bets - check if user already has a bet with different position
-        BetInfo storage existingBet = ledger[paymentTokenAddress][gameTokenAddress][epoch][msg.sender];
-        require(
-            existingBet.amount == 0 || existingBet.position == Position.Bear,
-            "Cannot bet on different position in same round"
-        );
+        BetInfo storage existingBet = ledger[paymentTokenAddress][
+            gameTokenAddress
+        ][epoch][msg.sender];
+        if (existingBet.amount != 0 && existingBet.position != Position.Bear) {
+            revert CannotBetOnDifferentPositionInSameRound();
+        }
 
         // Update round data
         Round storage round = rounds[paymentTokenAddress][gameTokenAddress][
@@ -370,7 +423,7 @@ contract PredictionGame is
         ][msg.sender];
         betInfo.position = Position.Bear;
         betInfo.amount = betInfo.amount + betAmount;
-        
+
         // Only add to userRounds if this is the first bet for this round
         if (betInfo.amount == betAmount) {
             userRounds[paymentTokenAddress][gameTokenAddress][msg.sender].push(
@@ -401,37 +454,30 @@ contract PredictionGame is
         uint256 reward; // Initializes reward
 
         for (uint256 i = 0; i < epochs.length; i++) {
-            require(
-                rounds[paymentTokenAddress][gameTokenAddress][epochs[i]]
-                    .startTimestamp != 0,
-                "Round has not started"
-            );
-            require(
-                block.timestamp >
-                    rounds[paymentTokenAddress][gameTokenAddress][epochs[i]]
-                        .endTimestamp,
-                "Round has not ended"
-            );
+            // Cache the round data to avoid multiple storage reads
+            Round memory round = rounds[paymentTokenAddress][gameTokenAddress][
+                epochs[i]
+            ];
+
+            if (round.startTimestamp == 0) {
+                revert RoundHasNotStarted();
+            }
+            if (block.timestamp <= round.endTimestamp) {
+                revert RoundHasNotEnded();
+            }
 
             uint256 addedReward = 0;
 
             // Round valid, claim rewards
-            if (
-                rounds[paymentTokenAddress][gameTokenAddress][epochs[i]]
-                    .oracleCalled
-            ) {
-                require(
-                    claimable(
+            if (round.oracleCalled) {
+                if (!claimable(
                         paymentTokenAddress,
                         gameTokenAddress,
                         epochs[i],
                         msg.sender
-                    ),
-                    "Not eligible for claim"
-                );
-                Round memory round = rounds[paymentTokenAddress][
-                    gameTokenAddress
-                ][epochs[i]];
+                    )) {
+                    revert NotEligibleForClaim();
+                }
                 addedReward =
                     (ledger[paymentTokenAddress][gameTokenAddress][epochs[i]][
                         msg.sender
@@ -440,15 +486,14 @@ contract PredictionGame is
             }
             // Round invalid, refund bet amount
             else {
-                require(
-                    refundable(
+                if (!refundable(
                         paymentTokenAddress,
                         gameTokenAddress,
                         epochs[i],
                         msg.sender
-                    ),
-                    "Not eligible for refund"
-                );
+                    )) {
+                    revert NotEligibleForRefund();
+                }
                 addedReward = ledger[paymentTokenAddress][gameTokenAddress][
                     epochs[i]
                 ][msg.sender].amount;
@@ -473,8 +518,8 @@ contract PredictionGame is
                 IWrappedNativeToken(wrappedNativeToken).withdraw(reward);
                 _safeTransferBNB(msg.sender, reward);
             } else {
-                // Transfer ERC20 tokens to user
-                IERC20(paymentTokenAddress).transfer(msg.sender, reward);
+                // Transfer ERC20 tokens to user using SafeERC20
+                IERC20(paymentTokenAddress).safeTransfer(msg.sender, reward);
             }
         }
     }
@@ -489,20 +534,23 @@ contract PredictionGame is
         address paymentTokenAddress,
         address gameTokenAddress,
         int256 price,
+        uint256 _minBetAmount,
         bytes32 /*zkProof*/
     ) external whenNotPaused onlyOperator {
-        require(
-            paymentTokenAddress != address(0),
-            "Payment token address cannot be zero"
-        );
-        require(
-            gameTokenAddress != address(0),
-            "Game token address cannot be zero"
-        );
-        require(
-            currentEpoch[paymentTokenAddress][gameTokenAddress] == 0,
-            "Token already initialized"
-        );
+        if (paymentTokenAddress == address(0)) {
+            revert PaymentTokenAddressCannotBeZero();
+        }
+        if (gameTokenAddress == address(0)) {
+            revert GameTokenAddressCannotBeZero();
+        }
+        if (currentEpoch[paymentTokenAddress][gameTokenAddress] != 0) {
+            revert TokenAlreadyInitialized();
+        }
+
+        if (_minBetAmount == 0) {
+            revert MustBeSuperiorToZero();
+        }
+        minBetAmount[paymentTokenAddress] = _minBetAmount;
 
         _initializeTokenGenesis(paymentTokenAddress, gameTokenAddress, price);
     }
@@ -586,18 +634,15 @@ contract PredictionGame is
         int256 currentPrice,
         bytes32 /* zkProof */
     ) external whenNotPaused onlyOperator {
-        require(
-            paymentTokenAddress != address(0),
-            "Payment token address cannot be zero"
-        );
-        require(
-            gameTokenAddress != address(0),
-            "Game token address cannot be zero"
-        );
-        require(
-            currentEpoch[paymentTokenAddress][gameTokenAddress] > 0,
-            "Token must be initialized first"
-        );
+        if (paymentTokenAddress == address(0)) {
+            revert PaymentTokenAddressCannotBeZero();
+        }
+        if (gameTokenAddress == address(0)) {
+            revert GameTokenAddressCannotBeZero();
+        }
+        if (currentEpoch[paymentTokenAddress][gameTokenAddress] == 0) {
+            revert TokenMustBeInitializedFirst();
+        }
 
         // CurrentEpoch refers to previous round (n-1)
         _safeLockRound(
@@ -635,17 +680,54 @@ contract PredictionGame is
 
     /**
      * @notice called by the admin to pause, triggers stopped state
+     * Enforces cooldown period and daily toggle limits to prevent rapid toggle attacks
      */
-    function pause() external whenNotPaused onlyAdminOrOperator {
+    function pause()
+        external
+        whenNotPaused
+        onlyAdminOrOperator
+        pauseCooldownCheck
+    {
         _pause();
     }
 
     /**
      * @notice called by the admin to unpause, returns to normal state
      * Reset genesis state. Once paused, the rounds would need to be kickstarted by genesis
+     * Enforces cooldown period and daily toggle limits to prevent rapid toggle attacks
      */
-    function unpause() external whenPaused onlyOwner {
+    function unpause() external whenPaused onlyOwner pauseCooldownCheck {
         _unpause();
+    }
+
+    /**
+     * @notice Get pause/unpause cooldown status
+     * @return timeRemaining seconds remaining until next toggle is allowed
+     * @return dailyCount current daily toggle count
+     * @return canToggle whether a toggle is currently allowed
+     */
+    function getPauseToggleStatus()
+        external
+        view
+        returns (uint256 timeRemaining, uint256 dailyCount, bool canToggle)
+    {
+        uint256 currentDay = block.timestamp / 86400;
+        uint256 effectiveDailyCount = (currentDay > lastToggleDay)
+            ? 0
+            : dailyToggleCount;
+
+        if (block.timestamp >= lastPauseToggleTime + PAUSE_COOLDOWN_PERIOD) {
+            timeRemaining = 0;
+        } else {
+            timeRemaining =
+                (lastPauseToggleTime + PAUSE_COOLDOWN_PERIOD) -
+                block.timestamp;
+        }
+
+        dailyCount = effectiveDailyCount;
+        canToggle =
+            (timeRemaining == 0) &&
+            (effectiveDailyCount < MAX_DAILY_PAUSE_TOGGLES);
     }
 
     /**
@@ -657,12 +739,13 @@ contract PredictionGame is
     function setMinBetAmount(
         address paymentTokenAddress,
         uint256 _minBetAmount
-    ) external whenPaused onlyOwner {
-        require(
-            paymentTokenAddress != address(0),
-            "Payment token address cannot be zero"
-        );
-        require(_minBetAmount != 0, "Must be superior to 0");
+    ) public whenPaused onlyOwner {
+        if (paymentTokenAddress == address(0)) {
+            revert PaymentTokenAddressCannotBeZero();
+        }
+        if (_minBetAmount == 0) {
+            revert MustBeSuperiorToZero();
+        }
         minBetAmount[paymentTokenAddress] = _minBetAmount;
 
         emit NewMinBetAmount(paymentTokenAddress, _minBetAmount);
@@ -675,7 +758,9 @@ contract PredictionGame is
     function setTreasuryFee(
         uint256 _treasuryFee
     ) external whenPaused onlyOwner {
-        require(_treasuryFee <= MAX_TREASURY_FEE, "Treasury fee too high");
+        if (_treasuryFee > MAX_TREASURY_FEE) {
+            revert TreasuryFeeTooHigh();
+        }
         treasuryFee = _treasuryFee;
 
         emit NewTreasuryFee(0, treasuryFee); // Using 0 as epoch since we now have multiple assets
@@ -686,7 +771,9 @@ contract PredictionGame is
      * callable by admin
      */
     function setOperator(address _operatorAddress) external onlyOwner {
-        require(_operatorAddress != address(0), "Cannot be zero address");
+        if (_operatorAddress == address(0)) {
+            revert CannotBeZeroAddress();
+        }
         operatorAddress = _operatorAddress;
 
         emit NewOperatorAddress(_operatorAddress);
@@ -699,7 +786,9 @@ contract PredictionGame is
     function setIntervalSeconds(
         uint256 _intervalSeconds
     ) external whenPaused onlyOwner {
-        require(_intervalSeconds > 0, "Must be superior to 0");
+        if (_intervalSeconds == 0) {
+            revert MustBeSuperiorToZero();
+        }
         intervalSeconds = _intervalSeconds;
 
         emit NewBufferAndIntervalSeconds(0, intervalSeconds);
@@ -711,12 +800,10 @@ contract PredictionGame is
      * @param paymentTokenAddress: payment token address to claim treasury for (use wrappedNativeToken for native payments)
      */
     function claimTreasury(address paymentTokenAddress) external onlyOwner {
-        require(
-            paymentTokenAddress != address(0),
-            "Payment token address cannot be zero"
-        );
+        if (paymentTokenAddress == address(0)) {
+            revert PaymentTokenAddressCannotBeZero();
+        }
         uint256 currentTreasuryAmount = treasuryAmount[paymentTokenAddress];
-        treasuryAmount[paymentTokenAddress] = 0;
 
         if (paymentTokenAddress == wrappedNativeToken) {
             // Unwrap tokens and send native tokens to treasury
@@ -725,12 +812,15 @@ contract PredictionGame is
             );
             _safeTransferBNB(treasuryAddress, currentTreasuryAmount);
         } else {
-            // Transfer ERC20 tokens to treasury
-            IERC20(paymentTokenAddress).transfer(
+            // Transfer ERC20 tokens to treasury using SafeERC20
+            IERC20(paymentTokenAddress).safeTransfer(
                 treasuryAddress,
                 currentTreasuryAmount
             );
         }
+
+        // Clear treasury amount after successful transfer (CEI pattern)
+        treasuryAmount[paymentTokenAddress] = 0;
 
         emit TreasuryClaim(paymentTokenAddress, currentTreasuryAmount);
     }
@@ -878,15 +968,12 @@ contract PredictionGame is
         address gameTokenAddress,
         uint256 epoch
     ) internal {
-        require(
-            rounds[paymentTokenAddress][gameTokenAddress][epoch]
-                .rewardBaseCalAmount ==
-                0 &&
+        if (rounds[paymentTokenAddress][gameTokenAddress][epoch]
+                .rewardBaseCalAmount != 0 ||
                 rounds[paymentTokenAddress][gameTokenAddress][epoch]
-                    .rewardAmount ==
-                0,
-            "Rewards calculated"
-        );
+                    .rewardAmount != 0) {
+            revert RewardsAlreadyCalculated();
+        }
         Round storage round = rounds[paymentTokenAddress][gameTokenAddress][
             epoch
         ];
@@ -941,17 +1028,15 @@ contract PredictionGame is
         uint256 epoch,
         int256 price
     ) internal {
-        require(
-            rounds[paymentTokenAddress][gameTokenAddress][epoch]
-                .lockTimestamp != 0,
-            "Can only end round after round has locked"
-        );
-        require(
-            block.timestamp >=
+        if (rounds[paymentTokenAddress][gameTokenAddress][epoch]
+                .lockTimestamp == 0) {
+            revert CanOnlyEndRoundAfterRoundHasLocked();
+        }
+        if (block.timestamp <
                 rounds[paymentTokenAddress][gameTokenAddress][epoch]
-                    .endTimestamp,
-            "Can only end round after endTimestamp"
-        );
+                    .endTimestamp) {
+            revert CanOnlyEndRoundAfterEndTimestamp();
+        }
 
         Round storage round = rounds[paymentTokenAddress][gameTokenAddress][
             epoch
@@ -982,16 +1067,23 @@ contract PredictionGame is
         uint256 epoch,
         int256 price
     ) internal {
-        require(
-            rounds[paymentTokenAddress][gameTokenAddress][epoch].startTimestamp != 0,
-            "Can only lock round after round has started"
-        );
+        if (rounds[paymentTokenAddress][gameTokenAddress][epoch]
+                .startTimestamp == 0) {
+            revert CanOnlyLockRoundAfterRoundHasStarted();
+        }
 
-        Round storage round = rounds[paymentTokenAddress][gameTokenAddress][epoch];
+        Round storage round = rounds[paymentTokenAddress][gameTokenAddress][
+            epoch
+        ];
         round.lockPrice = price;
         round.status = Status.Live;
 
-        emit LockRound(epoch, paymentTokenAddress, gameTokenAddress, round.lockPrice);
+        emit LockRound(
+            epoch,
+            paymentTokenAddress,
+            gameTokenAddress,
+            round.lockPrice
+        );
     }
 
     /**
@@ -1006,21 +1098,18 @@ contract PredictionGame is
         address gameTokenAddress,
         uint256 epoch
     ) internal {
-        require(
-            currentEpoch[paymentTokenAddress][gameTokenAddress] > 0,
-            "Token must be initialized first"
-        );
-        require(
-            rounds[paymentTokenAddress][gameTokenAddress][epoch - 2]
-                .endTimestamp != 0,
-            "Can only start round after round n-2 has ended"
-        );
-        require(
-            block.timestamp >=
+        if (currentEpoch[paymentTokenAddress][gameTokenAddress] == 0) {
+            revert TokenMustBeInitializedFirst();
+        }
+        if (rounds[paymentTokenAddress][gameTokenAddress][epoch - 2]
+                .endTimestamp == 0) {
+            revert CanOnlyStartRoundAfterRoundN2HasEnded();
+        }
+        if (block.timestamp <
                 rounds[paymentTokenAddress][gameTokenAddress][epoch - 2]
-                    .endTimestamp,
-            "Can only start new round after round n-2 endTimestamp"
-        );
+                    .endTimestamp) {
+            revert CanOnlyStartNewRoundAfterRoundN2EndTimestamp();
+        }
         _startRound(paymentTokenAddress, gameTokenAddress, epoch);
     }
 
@@ -1081,8 +1170,6 @@ contract PredictionGame is
             rounds[paymentTokenAddress][gameTokenAddress][epoch].lockTimestamp;
     }
 
-
-
     /**
      * @notice Transfer BNB in a safe way
      * @param to: address to transfer BNB to
@@ -1090,7 +1177,9 @@ contract PredictionGame is
      */
     function _safeTransferBNB(address to, uint256 value) internal {
         (bool success, ) = to.call{value: value}("");
-        require(success, "TransferHelper: BNB_TRANSFER_FAILED");
+        if (!success) {
+            revert TransferHelperBNBTransferFailed();
+        }
     }
 
     /**
